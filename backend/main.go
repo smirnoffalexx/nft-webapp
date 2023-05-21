@@ -2,9 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog/log"
 )
@@ -22,7 +22,7 @@ var CLIENT *ethclient.Client
 var FACTORY_ADDRESS string
 var COLLECTIONS []string
 var ABI map[string]abi.ABI
-var EVENTS map[string][]string
+var EVENTS map[string][]map[string]interface{}
 
 func main() {
 	err := godotenv.Load()
@@ -36,33 +36,15 @@ func main() {
 		return
 	}
 
-	EVENTS = make(map[string][]string)
+	go initGinRoutes()
+
+	EVENTS = make(map[string][]map[string]interface{})
 	FACTORY_ADDRESS = os.Getenv("FACTORY_ADDRESS")
 	CLIENT = connectNetwork()
 
 	log.Info().Msg("Log process started")
 
-	query := ethereum.FilterQuery{
-		Addresses: []common.Address{common.HexToAddress(FACTORY_ADDRESS)},
-	}
-
-	logs := make(chan types.Log)
-	sub, err := CLIENT.SubscribeFilterLogs(context.Background(), query, logs)
-	if err != nil {
-		log.Error().Msg("Can't subscribe filter logs")
-		return
-	}
-
-	for {
-		select {
-		case err := <-sub.Err():
-			log.Err(err).Msg("Subscribe error")
-		case vLog := <-logs:
-			if err := processLog(vLog); err != nil {
-				log.Err(err).Msg("Error occured while log process")
-			}
-		}
-	}
+	subscribeToEvents(FACTORY_ADDRESS)
 }
 
 func connectNetwork() *ethclient.Client {
@@ -105,50 +87,48 @@ func loadABI() error {
 	return nil
 }
 
-func processLog(vLog types.Log) error {
-	var abi abi.ABI
-	var eventName string
+func processTxLog(vLog types.Log) error {
 	contractAddress := vLog.Address.String()
 
-	if contractAddress == FACTORY_ADDRESS {
-		abi = ABI["CollectionFactory"]
-		eventName = "CollectionCreated"
-	} else {
-		abi = ABI["Collection"]
-		eventName = "TokenMinted"
-	}
+	for contract, abi := range ABI {
+		event, err := abi.EventByID(vLog.Topics[0])
+		if err != nil {
+			continue
+		}
 
-	event := make(map[string]interface{})
-	fmt.Println(vLog)
-	fmt.Println("before unpack")
-	err := abi.UnpackIntoMap(event, eventName, vLog.Data)
-	if err != nil {
-		fmt.Println("in unpack error")
-		return err
-	}
+		outputMap := make(map[string]interface{})
+		err = abi.UnpackIntoMap(outputMap, event.Name, vLog.Data)
+		if err != nil {
+			return err
+		}
 
-	rawEvent, err := json.Marshal(event)
-	if err != nil {
-		log.Error().Msg("Can't marshal event")
-	}
+		outputMap["event"] = event.Name
 
-	EVENTS[contractAddress] = append(EVENTS[contractAddress], string(rawEvent))
-	fmt.Println(EVENTS)
+		EVENTS[contractAddress] = append(EVENTS[contractAddress], outputMap)
 
-	if contractAddress == FACTORY_ADDRESS {
-		collectionAddress := event["collection"].(common.Address).String()
-		if !Contains(COLLECTIONS, collectionAddress) {
-			COLLECTIONS = append(COLLECTIONS, collectionAddress)
-			go subscribeNewCollection(common.HexToAddress(collectionAddress))
+		if contract == "CollectionFactory" {
+			collectionAddress := outputMap["collection"].(common.Address).String()
+			if !Contains(COLLECTIONS, collectionAddress) {
+				COLLECTIONS = append(COLLECTIONS, collectionAddress)
+				go subscribeToEvents(collectionAddress)
+			}
 		}
 	}
 
 	return nil
 }
 
-func subscribeNewCollection(address common.Address) {
+func subscribeToEvents(address string) {
+	topics := make([][]common.Hash, 1)
+
+	// Filter topics for Collection contracts (because mint emit 2 events: Transfer and TokenMinted)
+	if address != FACTORY_ADDRESS {
+		topics[0] = append(topics[0], common.HexToHash("0xc9fee7cd4889f66f10ff8117316524260a5242e88e25e0656dfb3f4196a21917"))
+	}
+
 	query := ethereum.FilterQuery{
-		Addresses: []common.Address{address},
+		Addresses: []common.Address{common.HexToAddress(address)},
+		Topics:    topics,
 	}
 
 	logs := make(chan types.Log)
@@ -163,36 +143,12 @@ func subscribeNewCollection(address common.Address) {
 		case err := <-sub.Err():
 			log.Err(err).Msg("Subscribe error")
 		case vLog := <-logs:
-			if err := processLog(vLog); err != nil {
+			if err := processTxLog(vLog); err != nil {
 				log.Err(err).Msg("Error occured while log process")
 			}
 		}
 	}
 }
-
-// func subscribeNewContract(address string) {
-// 	query := ethereum.FilterQuery{
-// 		Addresses: []common.Address{address},
-// 	}
-
-// 	logs := make(chan types.Log)
-// 	sub, err := CLIENT.SubscribeFilterLogs(context.Background(), query, logs)
-// 	if err != nil {
-// 		log.Error().Msg("Can't subscribe filter logs")
-// 		return
-// 	}
-
-// 	for {
-// 		select {
-// 		case err := <-sub.Err():
-// 			log.Err(err).Msg("Subscribe error")
-// 		case vLog := <-logs:
-// 			if err := processLog(vLog); err != nil {
-// 				log.Err(err).Msg("Error occured while log process")
-// 			}
-// 		}
-// 	}
-// }
 
 func Contains[T comparable](s []T, e T) bool {
 	for _, v := range s {
@@ -201,4 +157,29 @@ func Contains[T comparable](s []T, e T) bool {
 		}
 	}
 	return false
+}
+
+func initGinRoutes() {
+	router := gin.Default()
+	router.GET("/events", getEvents)
+	router.GET("/events/:address", getContractEvents)
+
+	router.Run("localhost:8080")
+}
+
+func getEvents(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"events": EVENTS})
+}
+
+func getContractEvents(c *gin.Context) {
+	address := c.Param("address")
+
+	for contract, events := range EVENTS {
+		if contract == address {
+			c.JSON(http.StatusOK, gin.H{"events": events})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, "No events with provided contract address")
 }
