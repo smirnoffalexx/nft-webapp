@@ -161,6 +161,7 @@ func Contains[T comparable](s []T, e T) bool {
 
 func initGinRoutes() {
 	router := gin.Default()
+	router.Use(CORSMiddleware())
 	router.GET("/events", getEvents)
 	router.GET("/events/:address", getContractEvents)
 
@@ -182,4 +183,16 @@ func getContractEvents(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, "No events with provided contract address")
+}
+
+func CORSMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Credentials", "true")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+		c.Header("Access-Control-Allow-Methods", "POST,HEAD,PATCH, OPTIONS, GET, PUT")
+
+		c.Next()
+	}
 }
